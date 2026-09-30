@@ -22,7 +22,6 @@ ID_DIAG_MAX = 0x6F3
 class IsoTpReassembler:
     """Reensambla tramas multi-frame acotado a 4 modulos."""
     def __init__(self):
-        # Memoria fija: 4 slots predefinidos para IDs 0x6F0 a 0x6F3
         self.buffers = {
             0x6F0: None,
             0x6F1: None,
@@ -45,12 +44,10 @@ class IsoTpReassembler:
 
             length = ((byte0 & 0x0F) << 8) | payload[1]
 
-            # Validar limites de tamano (8 a 64 bytes)
             if length > 64 or length < 8:
                 self.buffers[can_id] = None
                 return None
 
-            # Inicia o reinicia sesion (soporta First Frame repetido/reinicio)
             self.buffers[can_id] = {
                 "total_len": length,
                 "expected_seq": 1,
@@ -61,12 +58,10 @@ class IsoTpReassembler:
         # Consecutive Frame (CF)
         elif frame_type == 0x2:
             session = self.buffers[can_id]
-            # Descartar CF huerfano si no hay FF previo
             if session is None:
                 return None
 
             seq = byte0 & 0x0F
-            # Descartar si el numero de secuencia no es consecutivo
             if seq != session["expected_seq"]:
                 self.buffers[can_id] = None
                 return None
@@ -74,10 +69,9 @@ class IsoTpReassembler:
             session["data"].extend(payload[1:])
             session["expected_seq"] = (session["expected_seq"] + 1) % 16
 
-            # Verificar si se alcanzo la longitud esperada
             if len(session["data"]) >= session["total_len"]:
                 result_bytes = session["data"][:session["total_len"]]
-                self.buffers[can_id] = None  # Limpiar estado
+                self.buffers[can_id] = None
                 ts_ns = time.monotonic_ns()
                 decoded_str = result_bytes.decode("ascii", errors="replace")
                 return decoded_str, ts_ns
@@ -90,15 +84,14 @@ class IsoTpReassembler:
 def open_can_socket(interface_name: str) -> socket.socket:
     sock = socket.socket(socket.AF_CAN, socket.SOCK_RAW, socket.CAN_RAW)
     sock.bind((interface_name,))
-    # Timeout pequeno para permitir emitir stats de forma periodica aunque no lleguen tramas
-    sock.settimeout(0.5)
+    sock.settimeout(0.2)
     return sock
 
 
 def decode_telemetry(payload: bytes):
     v_raw, i_raw, t_raw, status, seq = struct.unpack("<HHBBH", payload[:8])
     return {
-        "voltage": round(v_raw * 0.1, 2),
+        "voltage": round(v_raw * 0.1, 1),
         "current": round(i_raw * 0.01, 2),
         "temp_c": t_raw - 40,
         "enabled": bool(status & 0x01),
@@ -110,6 +103,35 @@ def decode_telemetry(payload: bytes):
 
 def decode_fault(payload: bytes):
     return struct.unpack("<BB", payload[:2])
+
+
+def render_dashboard(telemetry, diags, faults):
+    """Renderiza el dashboard en consola para el modo normal."""
+    sys.stdout.write("\033[2J\033[H")
+    sys.stdout.write("DeepSea CAN Diagnostic Tool\n\n")
+    sys.stdout.write("--------------------------\n")
+    for i in range(4):
+        m = telemetry.get(i)
+        if m:
+            sys.stdout.write(
+                f"Module {i}:  {m['voltage']:>5.1f}V  {m['current']:>6.2f}A   {m['temp_c']:>2}C   "
+                f"enabled={str(m['enabled']):<5} fault={str(m['fault']):<5}\n"
+            )
+        else:
+            sys.stdout.write(f"Module {i}:  (esperando telemetria...)\n")
+    sys.stdout.write("---------------------------\n")
+    sys.stdout.write("Identification strings:\n")
+    for can_id in range(0x6F0, 0x6F4):
+        can_hex = f"0x{can_id:x}"
+        sys.stdout.write(f"  {can_hex}: {diags[can_hex]}\n")
+    sys.stdout.write("---------------------------\n")
+    sys.stdout.write("Recent faults:\n")
+    if faults:
+        for mod, code in reversed(faults[-5:]):
+            sys.stdout.write(f"  module {mod}, code {code}\n")
+    else:
+        sys.stdout.write("  (ninguna)\n")
+    sys.stdout.flush()
 
 
 def main():
@@ -127,17 +149,25 @@ def main():
     reassembler = IsoTpReassembler()
     frames_processed = 0
     last_stats_time = time.monotonic()
+    last_ui_time = time.monotonic()
 
-    if not args.grader:
-        print(f"Escuchando en {args.iface} (Modo Terminal)...")
+    telemetry_state = {}
+    faults_state = []
+    diag_state = {f"0x{can_id:x}": "(not yet received)" for can_id in range(0x6F0, 0x6F4)}
 
     try:
         while True:
-            # Emitir stats periodicos cada 2 segundos en modo grader
             now = time.monotonic()
+
+            # Modo Grader: stats periodicos cada 2s
             if args.grader and (now - last_stats_time >= 2.0):
                 print(json.dumps({"type": "stats", "frames_processed": frames_processed}), flush=True)
                 last_stats_time = now
+
+            # Modo Normal: refrescar pantalla a 5 Hz
+            if not args.grader and (now - last_ui_time >= 0.2):
+                render_dashboard(telemetry_state, diag_state, faults_state)
+                last_ui_time = now
 
             try:
                 raw_frame = sock.recv(16)
@@ -151,7 +181,7 @@ def main():
             can_id = can_id_raw & CAN_SFF_MASK
             data = payload_padded[:dlc]
 
-            # Filtrar ruido (no se cuenta)
+            # Filtrar ruido (no se procesa ni contabiliza)
             if NOISE_ID_MIN <= can_id <= NOISE_ID_MAX:
                 continue
 
@@ -161,6 +191,7 @@ def main():
                     frames_processed += 1
                     mod_id = can_id - ID_TELEMETRY_MIN
                     t = decode_telemetry(data)
+                    telemetry_state[mod_id] = t
                     if args.grader:
                         out = {
                             "type": "telemetry",
@@ -174,14 +205,15 @@ def main():
                             "derated": t["derated"]
                         }
                         print(json.dumps(out), flush=True)
-                    else:
-                        print(f"[TELEMETRIA] Mod {mod_id}: {t['voltage']}V | {t['current']}A | {t['temp_c']}C")
 
             # 2. Codigos de falla (0x1F0)
             elif can_id == ID_FAULT:
                 if len(data) >= 2:
                     frames_processed += 1
                     mod_id, code = decode_fault(data)
+                    faults_state.append((mod_id, code))
+                    if len(faults_state) > 10:
+                        faults_state.pop(0)
                     if args.grader:
                         out = {
                             "type": "fault",
@@ -189,16 +221,15 @@ def main():
                             "code": code
                         }
                         print(json.dumps(out), flush=True)
-                    else:
-                        print(f"[FALLA] Mod {mod_id}: codigo {code}")
 
-            # 3. Identificacion multi-trama (0x6F0 - 0x6F3)
+            # 3. Diagnostico multi-trama (0x6F0 - 0x6F3)
             elif ID_DIAG_MIN <= can_id <= ID_DIAG_MAX:
                 frames_processed += 1
                 res = reassembler.process(can_id, data)
                 if res is not None:
                     decoded_str, ts_ns = res
                     can_id_hex = f"0x{can_id:x}"
+                    diag_state[can_id_hex] = decoded_str
                     if args.grader:
                         out = {
                             "type": "diag_complete",
@@ -207,17 +238,12 @@ def main():
                             "ts_ns": ts_ns
                         }
                         print(json.dumps(out), flush=True)
-                    else:
-                        print(f"[DIAG] Modulo {can_id_hex}: {decoded_str}")
 
     except KeyboardInterrupt:
         pass
     finally:
-        # Emitir stats finales antes de salir
         if args.grader:
             print(json.dumps({"type": "stats", "frames_processed": frames_processed}), flush=True)
-        else:
-            print(f"\nTotal tramas procesadas: {frames_processed}")
         sock.close()
 
 
