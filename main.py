@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import json
 import socket
 import struct
 import sys
@@ -77,7 +78,9 @@ class IsoTpReassembler:
             if len(session["data"]) >= session["total_len"]:
                 result_bytes = session["data"][:session["total_len"]]
                 self.buffers[can_id] = None  # Limpiar estado
-                return result_bytes.decode("ascii", errors="replace")
+                ts_ns = time.monotonic_ns()
+                decoded_str = result_bytes.decode("ascii", errors="replace")
+                return decoded_str, ts_ns
 
             return None
 
@@ -87,6 +90,8 @@ class IsoTpReassembler:
 def open_can_socket(interface_name: str) -> socket.socket:
     sock = socket.socket(socket.AF_CAN, socket.SOCK_RAW, socket.CAN_RAW)
     sock.bind((interface_name,))
+    # Timeout pequeno para permitir emitir stats de forma periodica aunque no lleguen tramas
+    sock.settimeout(0.5)
     return sock
 
 
@@ -121,12 +126,24 @@ def main():
 
     reassembler = IsoTpReassembler()
     frames_processed = 0
+    last_stats_time = time.monotonic()
 
-    print(f"Escuchando en {args.iface}...")
+    if not args.grader:
+        print(f"Escuchando en {args.iface} (Modo Terminal)...")
 
     try:
         while True:
-            raw_frame = sock.recv(16)
+            # Emitir stats periodicos cada 2 segundos en modo grader
+            now = time.monotonic()
+            if args.grader and (now - last_stats_time >= 2.0):
+                print(json.dumps({"type": "stats", "frames_processed": frames_processed}), flush=True)
+                last_stats_time = now
+
+            try:
+                raw_frame = sock.recv(16)
+            except socket.timeout:
+                continue
+
             if len(raw_frame) < 16:
                 continue
 
@@ -144,25 +161,63 @@ def main():
                     frames_processed += 1
                     mod_id = can_id - ID_TELEMETRY_MIN
                     t = decode_telemetry(data)
-                    print(f"[TELEMETRIA] Mod {mod_id}: {t['voltage']}V | {t['current']}A | {t['temp_c']}C")
+                    if args.grader:
+                        out = {
+                            "type": "telemetry",
+                            "module": mod_id,
+                            "seq": t["seq"],
+                            "voltage": t["voltage"],
+                            "current": t["current"],
+                            "temp_c": t["temp_c"],
+                            "enabled": t["enabled"],
+                            "fault": t["fault"],
+                            "derated": t["derated"]
+                        }
+                        print(json.dumps(out), flush=True)
+                    else:
+                        print(f"[TELEMETRIA] Mod {mod_id}: {t['voltage']}V | {t['current']}A | {t['temp_c']}C")
 
             # 2. Codigos de falla (0x1F0)
             elif can_id == ID_FAULT:
                 if len(data) >= 2:
                     frames_processed += 1
                     mod_id, code = decode_fault(data)
-                    print(f"[FALLA] Mod {mod_id}: codigo {code}")
+                    if args.grader:
+                        out = {
+                            "type": "fault",
+                            "module": mod_id,
+                            "code": code
+                        }
+                        print(json.dumps(out), flush=True)
+                    else:
+                        print(f"[FALLA] Mod {mod_id}: codigo {code}")
 
             # 3. Identificacion multi-trama (0x6F0 - 0x6F3)
             elif ID_DIAG_MIN <= can_id <= ID_DIAG_MAX:
                 frames_processed += 1
-                result = reassembler.process(can_id, data)
-                if result:
-                    print(f"[DIAG] Modulo 0x{can_id:X}: {result}")
+                res = reassembler.process(can_id, data)
+                if res is not None:
+                    decoded_str, ts_ns = res
+                    can_id_hex = f"0x{can_id:x}"
+                    if args.grader:
+                        out = {
+                            "type": "diag_complete",
+                            "can_id": can_id_hex,
+                            "string": decoded_str,
+                            "ts_ns": ts_ns
+                        }
+                        print(json.dumps(out), flush=True)
+                    else:
+                        print(f"[DIAG] Modulo {can_id_hex}: {decoded_str}")
 
     except KeyboardInterrupt:
-        print(f"\nTotal tramas procesadas: {frames_processed}")
+        pass
     finally:
+        # Emitir stats finales antes de salir
+        if args.grader:
+            print(json.dumps({"type": "stats", "frames_processed": frames_processed}), flush=True)
+        else:
+            print(f"\nTotal tramas procesadas: {frames_processed}")
         sock.close()
 
 
