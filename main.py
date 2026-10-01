@@ -1,4 +1,16 @@
 #!/usr/bin/env python3
+"""!
+@file main.py
+@brief Diagnostic and telemetry monitoring tool for Level 3 DC Fast Chargers.
+@details Implements direct raw SocketCAN (AF_CAN) communication using exclusively
+         the Python standard library. Handles real-time telemetry extraction,
+         fault monitoring, bounded-memory ISO-TP diagnostic reassembly, noise
+         filtering, and NDJSON streaming for evaluation environments.
+@version 1.0.0
+@author Deybar Mora
+@date 2026-09-30
+"""
+
 import argparse
 import json
 import socket
@@ -6,22 +18,49 @@ import struct
 import sys
 import time
 
+## @brief Binary layout for standard Linux struct can_frame: ID (4B), DLC (1B), 3B padding, 8B payload.
 CAN_FRAME_FORMAT = "<IB3x8s"
+
+## @brief Bitmask for extracting standard 11-bit CAN identifiers.
 CAN_SFF_MASK = 0x000007FF
 
+## @brief Minimum CAN ID for the electrical noise injection range.
 NOISE_ID_MIN = 0x200
+
+## @brief Maximum CAN ID for the electrical noise injection range.
 NOISE_ID_MAX = 0x2FF
 
+## @brief Starting CAN identifier for power module telemetry (Module 0).
 ID_TELEMETRY_MIN = 0x100
+
+## @brief Ending CAN identifier for power module telemetry (Module 3).
 ID_TELEMETRY_MAX = 0x103
+
+## @brief CAN identifier designated for power module fault code frames.
 ID_FAULT = 0x1F0
+
+## @brief Starting CAN identifier for multi-frame identification strings (Module 0).
 ID_DIAG_MIN = 0x6F0
+
+## @brief Ending CAN identifier for multi-frame identification strings (Module 3).
 ID_DIAG_MAX = 0x6F3
 
 
 class IsoTpReassembler:
-    """Reensambla tramas multi-frame acotado a 4 modulos."""
+    """!
+    @brief ISO 15765-2 (ISO-TP) multi-frame reassembler with strictly bounded memory.
+    @details Implements a deterministic state machine to reconstruct multi-frame
+             diagnostic identification strings for up to 4 power modules. Resilient
+             against orphan consecutive frames, frame restarts, oversized length claims,
+             sequence anomalies, and repeated message abandonments.
+    """
+
     def __init__(self):
+        """!
+        @brief Initializes the reassembler with pre-allocated static slots.
+        @note Spatial complexity is bounded to O(1) by maintaining fixed slots
+              exclusively for CAN IDs 0x6F0 through 0x6F3.
+        """
         self.buffers = {
             0x6F0: None,
             0x6F1: None,
@@ -30,6 +69,14 @@ class IsoTpReassembler:
         }
 
     def process(self, can_id: int, payload: bytes):
+        """!
+        @brief Processes incoming CAN frame payloads for multi-frame reassembly.
+        @param can_id Standard 11-bit CAN identifier of the transmitting module.
+        @param payload Raw byte array containing frame payload (up to 8 bytes).
+        @return A tuple of `(decoded_string, timestamp_ns)` upon complete message
+                assembly; `None` if the frame was consumed, rejected, or incomplete.
+        @note Abandons in-progress reassembly without side effects upon protocol errors.
+        """
         if can_id not in self.buffers or not payload:
             return None
 
@@ -44,10 +91,12 @@ class IsoTpReassembler:
 
             length = ((byte0 & 0x0F) << 8) | payload[1]
 
+            # Reject invalid length bounds (must be between 8 and 64 bytes)
             if length > 64 or length < 8:
                 self.buffers[can_id] = None
                 return None
 
+            # Initialize or reset session (handles mid-message restarts)
             self.buffers[can_id] = {
                 "total_len": length,
                 "expected_seq": 1,
@@ -58,10 +107,12 @@ class IsoTpReassembler:
         # Consecutive Frame (CF)
         elif frame_type == 0x2:
             session = self.buffers[can_id]
+            # Drop orphan consecutive frames with no prior First Frame
             if session is None:
                 return None
 
             seq = byte0 & 0x0F
+            # Drop attempt on out-of-order sequence counter
             if seq != session["expected_seq"]:
                 self.buffers[can_id] = None
                 return None
@@ -69,6 +120,7 @@ class IsoTpReassembler:
             session["data"].extend(payload[1:])
             session["expected_seq"] = (session["expected_seq"] + 1) % 16
 
+            # Check if all declared bytes have been received
             if len(session["data"]) >= session["total_len"]:
                 result_bytes = session["data"][:session["total_len"]]
                 self.buffers[can_id] = None
@@ -82,13 +134,31 @@ class IsoTpReassembler:
 
 
 def open_can_socket(interface_name: str) -> socket.socket:
+    """!
+    @brief Configures and binds a raw SocketCAN interface.
+    @param interface_name Network interface identifier (e.g., 'vcan0').
+    @return An initialized and bound raw CAN socket object.
+    @throws OSError If network interface binding fails.
+    """
     sock = socket.socket(socket.AF_CAN, socket.SOCK_RAW, socket.CAN_RAW)
     sock.bind((interface_name,))
     sock.settimeout(0.2)
     return sock
 
 
-def decode_telemetry(payload: bytes):
+def decode_telemetry(payload: bytes) -> dict:
+    """!
+    @brief Decodes 8-byte little-endian telemetry payload from a power module.
+    @param payload Byte slice containing raw telemetry data.
+    @return Dictionary containing parsed engineering values:
+            - `voltage` (float): Module voltage in Volts (raw * 0.1).
+            - `current` (float): Module current in Amperes (raw * 0.01).
+            - `temp_c` (int): Internal module temperature in Celsius (raw - 40).
+            - `enabled` (bool): Module active state flag.
+            - `fault` (bool): Module fault trip flag.
+            - `derated` (bool): Module thermal derating flag.
+            - `seq` (int): Incrementing transmission sequence counter.
+    """
     v_raw, i_raw, t_raw, status, seq = struct.unpack("<HHBBH", payload[:8])
     return {
         "voltage": round(v_raw * 0.1, 1),
@@ -101,12 +171,22 @@ def decode_telemetry(payload: bytes):
     }
 
 
-def decode_fault(payload: bytes):
+def decode_fault(payload: bytes) -> tuple:
+    """!
+    @brief Decodes fault notification payload.
+    @param payload Byte slice containing module identifier and numeric fault code.
+    @return Tuple of `(module_id, fault_code)`.
+    """
     return struct.unpack("<BB", payload[:2])
 
 
-def render_dashboard(telemetry, diags, faults):
-    """Renderiza el dashboard en consola para el modo normal."""
+def render_dashboard(telemetry: dict, diags: dict, faults: list) -> None:
+    """!
+    @brief Renders a clean in-place terminal dashboard using ANSI escape codes.
+    @param telemetry Dictionary storing the latest telemetry packet per module index.
+    @param diags Dictionary mapping CAN IDs to reassembled diagnostic strings.
+    @param faults List storing tuples of recent faults (module_id, code).
+    """
     sys.stdout.write("\033[2J\033[H")
     sys.stdout.write("DeepSea CAN Diagnostic Tool\n\n")
     sys.stdout.write("--------------------------\n")
@@ -134,10 +214,15 @@ def render_dashboard(telemetry, diags, faults):
     sys.stdout.flush()
 
 
-def main():
+def main() -> None:
+    """!
+    @brief Application entry point. Parses CLI options and runs CAN event loop.
+    @details Dispatches between interactive terminal dashboard view and
+             machine-readable NDJSON streaming depending on `--grader` flag.
+    """
     parser = argparse.ArgumentParser(description="DeepSea CAN Diagnostic Tool")
-    parser.add_argument("--iface", default="vcan0", help="Interfaz CAN")
-    parser.add_argument("--grader", action="store_true", help="Modo evaluacion")
+    parser.add_argument("--iface", default="vcan0", help="CAN network interface")
+    parser.add_argument("--grader", action="store_true", help="Automated grader NDJSON mode")
     args = parser.parse_args()
 
     try:
@@ -159,12 +244,12 @@ def main():
         while True:
             now = time.monotonic()
 
-            # Modo Grader: stats periodicos cada 2s
+            # Emit periodic stats line every 2.0s when running under grader mode
             if args.grader and (now - last_stats_time >= 2.0):
                 print(json.dumps({"type": "stats", "frames_processed": frames_processed}), flush=True)
                 last_stats_time = now
 
-            # Modo Normal: refrescar pantalla a 5 Hz
+            # Refresh terminal UI at 5 Hz (200 ms) in normal dashboard mode
             if not args.grader and (now - last_ui_time >= 0.2):
                 render_dashboard(telemetry_state, diag_state, faults_state)
                 last_ui_time = now
@@ -181,11 +266,11 @@ def main():
             can_id = can_id_raw & CAN_SFF_MASK
             data = payload_padded[:dlc]
 
-            # Filtrar ruido (no se procesa ni contabiliza)
+            # Filter out bus noise (0x200 - 0x2FF): never process nor count
             if NOISE_ID_MIN <= can_id <= NOISE_ID_MAX:
                 continue
 
-            # 1. Telemetria (0x100 - 0x103)
+            # 1. Telemetry decoding (0x100 - 0x103)
             if ID_TELEMETRY_MIN <= can_id <= ID_TELEMETRY_MAX:
                 if len(data) >= 8:
                     frames_processed += 1
@@ -206,7 +291,7 @@ def main():
                         }
                         print(json.dumps(out), flush=True)
 
-            # 2. Codigos de falla (0x1F0)
+            # 2. Fault code decoding (0x1F0)
             elif can_id == ID_FAULT:
                 if len(data) >= 2:
                     frames_processed += 1
@@ -222,7 +307,7 @@ def main():
                         }
                         print(json.dumps(out), flush=True)
 
-            # 3. Diagnostico multi-trama (0x6F0 - 0x6F3)
+            # 3. Multi-frame ISO-TP diagnostic decoding (0x6F0 - 0x6F3)
             elif ID_DIAG_MIN <= can_id <= ID_DIAG_MAX:
                 frames_processed += 1
                 res = reassembler.process(can_id, data)
